@@ -1,0 +1,653 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%Pre-Calculate ODE solutions - can comment this out if already have the
+%%precalculated results stored in the PreCalc file 
+%
+% PreCalcTimes = linspace(0,365,366);
+% PreCalc_PTD_RANGE = linspace(0,0.3,1000);
+% 
+% PreCalcPERCENT_REDUCTION = zeros(366,1000);
+% 
+% for i = 2:366
+%     disp(i)
+%     for j = 1:1000
+%         PreCalcPERCENT_REDUCTION(i,j) = GetVCReductionPct(PreCalc_PTD_RANGE(j),PreCalcTimes(i),2);
+%     end
+% end
+% 
+% PreCalc.Times = PreCalcTimes;
+% PreCalc.ptd = PreCalc_PTD_RANGE;
+% PreCalc.percent = PreCalcPERCENT_REDUCTION;
+% save("PreCalc.mat","PreCalc")
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+load("PreCalc.mat")
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+
+%Distributions of our variables for trap data
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+reduction_vals = cat(2,linspace(0,98,100),linspace(98.1,99.99,25));
+
+density = betapdf(0.01*reduction_vals,12,3);
+
+[p_td_vals, ptd_pdf] = Get_PDF_ptd(reduction_vals, density,PreCalc);
+
+gmax = 100;
+g0_vals = linspace(0,gmax,1000);
+g0_pdf = unifpdf(g0_vals,0,gmax);
+
+
+OD_vals = cat(2,linspace(0,1,100), linspace(1.01,10,50));
+OD_pdf = unifpdf(OD_vals,0,10);
+
+Prior_ptd_PDF = ptd_pdf;
+Prior_ptd_VALUES = p_td_vals;
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+myfontsize = 16;
+Strategy_Colour_Palette = ["#b3cde3","#8c96c6","#8856a7","#810f7c"];
+
+
+Cloc = 'DRC';
+Ploc = 1;
+Zloc = 29;
+ParaStr = 'DRC101';
+RunProjection = 100; % options: 1-1000 (number of realizations for Projection)
+RunSamples = 0;
+RunPlot = 1;
+% 
+%%% Import raw data
+if Zloc ~= 0 % health Zone level simulation
+    p = dir(['../Data/', Cloc, '/P', num2str(Ploc), '_*']);
+    load(['../Data/', Cloc, '/', p.name, '/Data.mat']);
+    z.name = strcat('Z', num2str(Zloc), '_', CCLOC{Zloc});
+    names = {z.name, p.name, Cloc};
+    location = Zloc;
+    ResultDir = ['../Result/', Cloc, '/', p.name, '/', z.name, '/'];
+    PosteriorDir = ['../Posteriors/', p.name, '/', z.name, '/'];
+    ICsDir = ['../ICs/', p.name, '/', z.name, '/'];
+elseif Ploc ~= 0 % province level simulation
+    load(['../Data/', Cloc, '/Data.mat']);
+    p.name = strcat('P', num2str(Ploc), '_', CCLOC{Ploc});
+    names = {p.name, Cloc};
+    location = Ploc;
+    ResultDir = ['../Result/', Cloc, '/', p.name, '/'];
+    PosteriorDir = ['../Posteriors/', p.name, '/'];
+    ICsDir = ['../ICs/', p.name, '/'];
+else % country level simulation
+    load(['../Data/Data.mat']);
+    names = {Cloc};
+    location = find(strcmp(COUNTRY, Cloc));
+    ResultDir = ['../Result/', Cloc, '/'];
+    PosteriorDir = ['../Posteriors/'];
+    ICsDir = ['../ICs/'];
+end
+mkdir(ResultDir)
+LocStr = LOCSTR{location}; % location info string ending with the name of smallest scale
+IDStr = ['_ID', ParaStr];
+M = 'M4';
+FileStr = ['_', M, '_'];
+input1 = load([PosteriorDir, 'Posterior', FileStr, LocStr, IDStr, '.mat']);
+
+if size(input1.Posterior, 1) == 1
+    Message = ['No inference performed in the selected location (', LocStr, ')']
+    save([ResultDir, 'NoInferencePerformed.mat'], 'Message')
+    return;
+end
+
+%%% Parameters
+load(['Paras_', ParaStr, '.mat']);
+
+% FixedParameters for current location...
+x = 0;
+a = 0;
+while x == 0
+    a = a + 1;
+    x = strcmp(FixedParameters.Location, names{a});
+end
+locFixedPar = FixedParameters(strcmp(FixedParameters.Location, names{a}), ...
+                              ~strcmp(FixedParameters.Properties.VariableNames,'Location'));
+
+% Intervention parameters
+x = 0;
+a = 0;
+while x == 0
+    a = a + 1;
+    x = contains(InterventionParameters.Location, names{a});
+end
+Irow = find(contains(InterventionParameters.Location, names{a}));
+
+% FittedParameters for current location...
+locFittedPar = cell2table(cell(0,width(FittedParameters)),'VariableNames',FittedParameters.Properties.VariableNames);
+% work from most-local to least-local area name
+for i = 1:length(names)
+    % Keep line if 1) Location matches current level, and
+    %              2) parameter hasn't been matched at a more local level.
+    choose = (strcmp(FittedParameters.Location, names{i}) .* ...        
+              ~ismember(FittedParameters.Notation, char(locFittedPar.Notation))) == 1;
+    locFittedPar = [locFittedPar; FittedParameters(choose,:)];
+end
+locFittedPar = locFittedPar(:,~strcmp(locFittedPar.Properties.VariableNames,'Location')); % drop location
+locFittedPar = [locFittedPar(~startsWith(locFittedPar.Notation,'active_neg_'),:);...                       % if fitting neg active tests,
+                sortrows(locFittedPar(startsWith(locFittedPar.Notation,'active_neg_'),:), 'Notation')];    % put that chunk, sorted, last.
+
+% FittedParameters for current model only
+FittedAll = locFittedPar(contains(locFittedPar.Model, [string('All'), M]), {'Notation','Initial'});
+fitted_para_names = locFittedPar.Notation(contains(locFittedPar.Model, [string('All'), M]) & ~contains(locFittedPar.Distribution, 'Delta'))';
+
+% Parameter reorganisation - all parameters 
+Paras = table2struct([cell2table(num2cell(FittedAll.Initial)', 'VariableNames', FittedAll.Notation'), locFixedPar, InterventionParameters(Irow, 2:end)]); % input parameters for main functions
+
+Paras.eta_H_amp = Paras.eta_H_amp * (Paras.d_change ~=  0);     % set eta_H_amp   = 0 if d_change = 0
+Paras.gamma_H_amp = Paras.gamma_H_amp * (Paras.d_change ~=  0); % set gamma_H_amp = 0 if d_change = 0
+
+% Final year in which the active screening specifity can be lower (eg for MSF screenings)
+Paras.Last_year = locFittedPar.Last_year(strcmp(locFittedPar.Notation, 'b_specificity'));
+
+% localise Strategy
+x = 0;
+a = 0;
+while x == 0
+    a = a + 1;
+    x = strcmp(Strategy.Location, names{a});
+end
+locStrategy = Strategy(strcmp(Strategy.Location, names{a}), ...
+                       ~strcmp(Strategy.Properties.VariableNames,'Location'));
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%Select number of strategies
+NumStrat = 4;
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+%%% Data processing
+N_H = PopSize(location);
+Data = struct('Years', YEAR, 'N_H', N_H, 'PopSizeYear', PopSizeYear,...
+              'MeanPeopleScreened', MeanPeopleScreened(location), 'MaxPeopleScreened', MaxPeopleScreened(location),...
+              'LocStr', LocStr, 'IDStr', IDStr); % input data for main functions 'DirStr', Dir
+Data.FileStr = ['_', M, '_']; % for MCMC, Fitted dynamics and ReactInfo
+FileStr = ['_', M, '_React0_'];
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+
+%%% Run simulation
+NumPosterior = RunProjection; % number of realizations used in Porjection
+samples = RunSamples;
+
+Years = 2020 : 2050;
+
+NumYear = length(Years); % fixed value for all strategies
+MtoAbsScaling = Paras.PopGrowth .^ double(Years - Data.PopSizeYear);
+
+[Active1All, Active2All, Passive1All, Passive2All, DeathsAll, PersonYrs1All, PersonYrs2All, NewInfAll] = deal(zeros(NumPosterior * samples, NumYear, NumStrat));
+[SampledActive1All, SampledActive2All, SampledPassive1All, SampledPassive2All, SampledDeathsAll] = deal(zeros(NumPosterior * samples, NumYear, NumStrat));
+[YEPHP, YEOT, SampledYEPHP] = deal(zeros(NumPosterior * samples, NumStrat));
+[PEPHP, PEOT, SampledPEPHP] = deal(zeros(NumYear, NumStrat));
+
+input2 = load([ICsDir, 'ProjectionICs', Data.FileStr, Data.LocStr, IDStr, '.mat']);
+RowID = datasample(1:1000, NumPosterior, 'Replace', false); % randomly select realizations from PostID in ICs
+PostID = input2.ProjectionICs.PostID(RowID);
+SampPostID = reshape(repmat(PostID', samples, 1), [], 1);
+
+%Initialise variables
+N_V = zeros(NumPosterior, NumStrat, 2000);
+EFF = zeros(NumPosterior, NumStrat, 2000);
+Times = zeros(NumPosterior, NumStrat, 2000);
+lengths = zeros(NumPosterior, NumStrat);
+Year_No_Inf = zeros(NumPosterior, NumStrat);
+DALYS = zeros(NumPosterior, NumStrat);
+Screening_Active_Inf = DALYS;
+Screening_Passive_Inf = DALYS;
+Screening_NotInf = DALYS;
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+function Output = tinytargets(Time_years, p_target_die, Target_frequency)
+    Time_days = 365 * (Time_years);
+    t = mod(Time_days,365./Target_frequency);
+    Output = p_target_die .* (1 - 1./(1+exp(-25/365*(t-0.35*365))));
+end
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%5
+
+p_td_range = p_td_vals;
+WTP_vals = [6.3,289,653,653*3];
+Strategy_Names = string(zeros(1,4));
+Strategy_Names(1) = 'Complete VC';
+Strategy_Names(2) = 'Initial VC';
+Strategy_Names(3) = 'Delayed VC';
+Strategy_Names(4) = 'No VC';
+Total_Costs = zeros(length(p_td_range), NumStrat, length(WTP_vals));
+
+disp('Starting Simulations')
+
+%Loop through all values of p target die
+for p_count = 1:length(p_td_range)
+
+    ACTUAL_PTD = p_td_range(p_count);
+
+    for p = 1 : NumPosterior
+        ['Posterior', num2str(PostID(p))];
+        % Replace values of fitted parameters in Paras by the values from Posterior
+        for i = 1 : length(fitted_para_names)
+            Paras.(fitted_para_names{i}) = input1.Posterior{PostID(p), i};
+        end
+        ICs = table2struct(input2.ProjectionICs(RowID(p), :));
+
+        myICS = {[ICs.S_H1, ICs.S_H2, ICs.S_H3, ICs.S_H4], [ICs.E_H1, ICs.E_H2, ICs.E_H3, ICs.E_H4], [ICs.I1_H1, ICs.I1_H2, ICs.I1_H3, ICs.I1_H4],...
+               [ICs.I2_H1, ICs.I2_H2, ICs.I2_H3, ICs.I2_H4], [ICs.R_H1, ICs.R_H2, ICs.R_H3, ICs.R_H4],...
+                ICs.S_A, ICs.E_A, ICs.I1_A, ICs.P_V, ICs.S_V, ICs.G_V, ICs.E1_V, ICs.E2_V, ICs.E3_V, ICs.I_V};
+
+        [meff, ~] = GetEndemicEq(Data.N_H, Paras); 
+
+        Data.Years = Years;
+
+        %Set strategy
+        for s = 1:NumStrat
+            S = ['Strat', num2str(7)];
+
+            % Set up the strategy, using strategies 1,2,3,4
+            ProjStrat = table2struct(Strategy(S,:));
+            ProjStrat.NewVCyear = 2021;
+            ProjStrat.SIMyear = 2050;
+            %The first two srategies begin with 1 year of VC
+            if s <= 2
+                Paras.TargetFreq = 2;
+                Paras.TargetDie = ACTUAL_PTD;
+                Paras.VCstart = 1;
+            else
+                Paras.TargetDie = 0;
+                Paras.TargetFreq = 0;
+                Paras.VCstart = 1;
+            end
+            %Only strategies 1 and 3 do VC after the first year
+            if mod(s,2) < 0.5
+                ProjStrat.NewTargetFreq = 0;
+                ProjStrat.NewTargetDie = 0;
+            else
+                ProjStrat.NewTargetFreq = 2;
+                ProjStrat.NewTargetDie = ACTUAL_PTD;
+            end
+
+
+
+            %We use mean AS
+            ProjStrat.NewASnum = 'mean';
+            switch ProjStrat.NewASnum
+                case 'mean'
+                    Data.PeopleScreened = Data.MeanPeopleScreened * ones(1, length(Data.Years));
+                case 'max'
+                    Data.PeopleScreened = Data.MaxPeopleScreened * ones(1, length(Data.Years));
+                otherwise % percentage
+                    Data.PeopleScreened = round(0.01 * str2num(ProjStrat.NewASnum(1 : end - 1)) * Data.N_H * Paras.PopGrowth^double(Data.Years(1) - 3 - Data.PopSizeYear)) * ones(1, length(Data.Years));
+            end
+            ScaledPeopleScreened = Data.PeopleScreened ./ MtoAbsScaling;
+            ModelScreeningFreq = [];
+            ModelScreeningTime = [];
+            ModelPeopleScreened = [];
+            ExpectedScreeningTimes = ceil(ScaledPeopleScreened / Data.N_H / Paras.k1);
+            ExpectedScreeningTimes(ExpectedScreeningTimes == 0) = 1;
+            for y = 1 : length(Data.Years)
+                freq = 365 / ExpectedScreeningTimes(y);
+                time = 1 / ExpectedScreeningTimes(y);
+                number = ScaledPeopleScreened(y) / ExpectedScreeningTimes(y);
+
+                ModelScreeningFreq = [ModelScreeningFreq freq * ones(1, ExpectedScreeningTimes(y))];
+                ModelScreeningTime = [ModelScreeningTime Data.Years(y) + (0 : ExpectedScreeningTimes(y) - 1) * time];
+                ModelPeopleScreened = [ModelPeopleScreened number * ones(1, ExpectedScreeningTimes(y))];
+            end
+
+            Data.ModelScreeningFreq = ModelScreeningFreq;
+            Data.ModelScreeningTime = ModelScreeningTime;
+            Data.ModelPeopleScreened = ModelPeopleScreened;
+
+            %Run the ODE
+            [Classes, Aggregate] = ODEHATmodel(meff, myICS, Data, Paras, ProjStrat);
+
+            infected1 = Classes.I1_H1 + Classes.I1_H2 + Classes.I1_H3 + Classes.I1_H4 + Classes.I1_A;
+            infected2 = Classes.I2_H1 + Classes.I2_H2 + Classes.I2_H3 + Classes.I2_H4 + Classes.I2_A;
+            total_infected = infected1 + infected2;
+            nomorecases = max([find(total_infected >= 1, 1, 'last') 0]);
+            Year_No_Inf(p,s) = max([find(Aggregate.NewInfM' .* MtoAbsScaling >= 1.0, 1, 'last') 0]) + Years(1); % no transmission threshold = 1
+
+            %Calculate DALYS
+
+            %DALY weightings
+            Inf1_weight = 0.14;
+            Inf2_weight = 0.54;
+
+            %Expected years of life lost from mortality
+            Years_Dead = 21.54;
+            %3 percent yearly discounting
+            Discounting = transpose(power((1/1.03),linspace(0,(2050-2020),(2050-2020+1))));
+            DALYS(p,s) = Inf1_weight*sum(Aggregate.PersonYrsM1 .* Discounting) + Inf2_weight*sum(Aggregate.PersonYrsM2 .* Discounting) + Years_Dead * sum(Aggregate.DeathsM .* Discounting);
+
+            %Calculate Screening
+            Screening_Active_Inf(p,s) = sum(Discounting.* (Aggregate.ActiveM1 + Aggregate.ActiveM2));
+            Screening_Passive_Inf(p,s) = sum(Discounting.* (Aggregate.PassiveM1 + Aggregate.PassiveM2));
+            Screening_NotInf(p,s) = sum(transpose(Discounting) .* Data.ModelPeopleScreened) - Screening_Active_Inf(p,s);
+
+            %Store infection dynamics
+            lengths(p,s) = length(Classes.Time);
+            N_V(p,s,1:length(Classes.Time)) = Classes.P_V + Classes.S_V + Classes.G_V + Classes.E1_V + Classes.E2_V + Classes.E3_V + Classes.I_V;
+            Times(p,s, 1:length(Classes.Time)) = Classes.Time;
+
+            %Calculate tiny target effectiveness over time
+            time_vals = Classes.Time;
+            p_targetdie = zeros(size(time_vals));
+            TargetFreq = ones(size(time_vals));
+
+            if Paras.VCstart ~= 0
+                Y1 = find(time_vals >= Paras.VCstart, 1);
+                p_targetdie(Y1:end) = Paras.TargetDie;
+                TargetFreq(Y1:end) = Paras.TargetFreq;
+            end
+            if ProjStrat.NewVCyear ~= 0
+                Y2 = find(time_vals >= ProjStrat.NewVCyear, 1);
+                p_targetdie(Y2:end) = ProjStrat.NewTargetDie;
+                TargetFreq(Y2:end) = ProjStrat.NewTargetFreq;
+            end
+
+            eff = tinytargets(time_vals, p_targetdie,TargetFreq);
+            EFF(p,s, 1:length(Classes.Time)) = eff;
+
+        end
+    end
+
+    %Calculate end of transmission
+    Prob = zeros(NumStrat,2050 - 2019);
+    YearEnd = zeros(1,NumStrat);
+    for i = 1:NumStrat
+        for y = 2020 : 2050
+            Prob(i,y-2019) = mean(Year_No_Inf(:,i) <= y);
+        end
+        if Prob(i,end) >= 1
+            year_end_of_VC = Years(find(Prob(i,:) >= 1, 1)) + 3;
+        else
+            year_end_of_VC = 2050;
+        end
+        YearEnd(i) = min(year_end_of_VC, 2050);
+    end
+
+
+
+    %Calculate means of screening and dalys over the posterior
+    meanDALYs = zeros(1,NumStrat);
+    meanInfPS = zeros(1,NumStrat);
+    meanInfAS = zeros(1,NumStrat);
+    meanUnInfS = zeros(1,NumStrat);
+    for i = 1:NumStrat
+        meanDALYs(i) = mean(squeeze(DALYS(:,i)), 1);
+        meanInfAS(i) = mean(squeeze(Screening_Active_Inf(:,i)),1);
+        meanInfPS(i) = mean(squeeze(Screening_Passive_Inf(:,i)),1);
+        meanUnInfS(i) = mean(squeeze(Screening_NotInf(:,i)),1);
+    end
+
+
+    for WTP_index = 1:length(WTP_vals)
+        DALY_WTP = WTP_vals(WTP_index); 
+        DALY_Cost = DALY_WTP * meanDALYs;
+
+        %VC still needs discounting, unlike DALYs and Screening done before
+        Yearly_Cost = 0.8902 * Data.N_H; %Rough value, is from paper
+        DiscountingVCYears = [sum(Discounting(1:(YearEnd(1) - 2020))), 1, sum(Discounting(2:(YearEnd(3) - 2021))), 0];
+        VC_Cost = Yearly_Cost .* DiscountingVCYears;
+
+        %Calculate costs
+        %COSTS CAN BE FOUND IN SUPP MATERIALS - E.9
+        Screening_Years = YearEnd - 2020;
+        FixedASCosts = 79281;
+        CostPerInfectedAS = 2.5+11.09;
+        CostPerInfectedPS = 2.9+11.09;
+        FixedPSCosts = 8942 + 0;
+        CostPerUnInfScreen = 2.5;
+        Screening_Costs = (FixedPSCosts + FixedASCosts) .* Screening_Years + CostPerUnInfScreen .* meanUnInfS + CostPerInfectedAS .* meanInfAS + CostPerInfectedPS .* meanInfPS;
+
+
+        Total_Costs(p_count,:,WTP_index) = DALY_Cost + VC_Cost + Screening_Costs;
+    end
+
+    percent = p_count / length(p_td_range) * 100;
+    disp(string(percent) + '% complete')
+
+end
+
+%Store Net Monetary Benefit
+NMB = zeros(size(Total_Costs));
+for i = 1:NumStrat
+    NMB(:,i,:) = Total_Costs(:,4,:) - Total_Costs(:,i,:);
+end
+
+save("NMB.mat","NMB","NumStrat","NumPosterior")
+load("NMB.mat")
+
+
+disp('Simulations Finished')
+
+%Plot Net Monetary Benefit vs p target die for different strategies
+for k = 1:length(WTP_vals)
+    figure(k)
+    clf(k)
+    hold on
+    for i = 1:NumStrat
+        plot(p_td_range, squeeze(NMB(:,i,k)), 'DisplayName',Strategy_Names(i),'Color',Strategy_Colour_Palette(i),'Linewidth',4)
+    end
+    hold off
+    xlabel('p target die','FontSize',myfontsize)
+    ylabel('Expected Net Monetary Benefit','FontSize',myfontsize)
+    title('NMB with WTP of ' + string(WTP_vals(k)))
+    legend('FontSize',myfontsize)
+    set(findall(gcf,'-property','FontSize'),'FontSize',myfontsize)
+end
+
+minNMB = min(NMB,[],'all');
+maxNMB = max(NMB,[],'all');
+
+% 
+% For AAM:
+% Given a p_targetdie we can calculate the expected catch data - we assume
+% 1 flies per trap at the start as average
+% 0.1 overdispersion in the data from each individual trap
+% From this and a monitoring strategy, we can update the prior, and 
+% determine the best course of action
+
+disp('Calculating Active Adaptive Management Procedure')
+
+%Set out the monitoring times and number of traps used at each of these
+%times. Note, these two arrays must have the same length, and each of their
+%corresponding elements must also be of the same length.
+MonitoringTimes = {[0 360], [0 360], [0 360], [0 360], [0 360], [0 360], [0 360], [0 360], [0 360], [0 360]};
+MonitoringNums = {[100 100], [200 200], [300 300], [400 400], [500 500], [600 600], [750 750], [900 900], [1050 1050], [1200 1200]};
+%Set the number of times we wish to calculate benefit, to get an average
+%over
+BenSamples = 12;
+Benefit = zeros(length(MonitoringTimes),length(WTP_vals),BenSamples);
+
+%Set which prior: 1 is narrow, 2 is wide
+pri = 2;
+
+if pri == 1
+    [p_td_vals, ptd_pdf] = Get_PDF_ptd(reduction_vals, density,PreCalc);
+else
+    density_wide = betapdf(0.01*reduction_vals,4.5,1.5);
+    [p_td_vals, ptd_pdf] = Get_PDF_ptd(reduction_vals, density_wide,PreCalc);
+end
+
+%Set which monitoring strategy you wish to plot the NMB curve and expected
+%NMB bar graph for
+ToPlotMonIndex = 1;
+
+for Sample_ind = 1:BenSamples
+    for Mon_ind = 1:length(MonitoringTimes)
+        %Initialise array for choice of which strategy
+        AAM_Choice = zeros(length(WTP_vals),length(p_td_range));
+        for p_count = 1:length(p_td_range)
+            %Create synthetic data
+            artificial_OD = 0.1;
+            artificial_g0 = 1;
+            ACTUAL_PTD = p_td_range(p_count);
+            TrapTimes = MonitoringTimes{Mon_ind};
+            TrapNumbers = MonitoringNums{Mon_ind};
+            TrapCounts = TrapNumbers;
+            for i = 1:length(TrapCounts)
+                actual_reduction = FastGetReduction(ACTUAL_PTD,TrapTimes(i),PreCalc);
+                r = TrapNumbers(i) / artificial_OD;
+                p = 1 / (1 + artificial_OD * artificial_g0 * (100-actual_reduction)/100);
+                TrapCounts(i) = nbinrnd(r,p);
+            end
+    
+            %Obtain the posterior
+            [ptd_MC,g0_MC,OD_MC] = UpdatePrior(1000, TrapCounts, TrapNumbers, TrapTimes, p_td_vals, g0_vals,OD_vals,ptd_pdf,g0_pdf,OD_pdf,PreCalc);
+        
+            [hist_sizes,hist_edges] = histcounts(ptd_MC(200:end),200);
+            Posterior_ptd_VALUES = hist_edges(1:length(hist_edges)-1) + (hist_edges(2:end) - hist_edges(1:length(hist_edges)-1)) ./ 2;
+            Posterior_ptd_PDF = hist_sizes ./ trapz(Posterior_ptd_VALUES, hist_sizes);
+        
+            for WTP_index = 1:length(WTP_vals)
+                %Use linear interpolation to get the costs at each value of
+                %Posterior_ptd_VALUES - do this for continuing and stopping strategies
+                interpolated_costs_stop = zeros(size(Posterior_ptd_VALUES));
+                interpolated_costs_continue = zeros(size(Posterior_ptd_VALUES));
+                for i = 1:length(Posterior_ptd_VALUES)
+                    ptd_value = Posterior_ptd_VALUES(i);
+                    index = find(p_td_range >= ptd_value,1) - 1;
+                    if isempty(index)
+                        index = length(p_td_range) - 1;
+                    end
+                    if index < 1
+                        index = 1;
+                    end
+                    coeff = (ptd_value - p_td_range(index)) / (p_td_range(index+1) - p_td_range(index));
+                    if isnan(coeff)
+                        coeff = 0;
+                    end
+                    interpolated_costs_stop(i) = NMB(index,2,WTP_index) + coeff * (NMB(index+1,2,WTP_index) - NMB(index,2,WTP_index));
+                    interpolated_costs_continue(i) = NMB(index,1,WTP_index) + coeff * (NMB(index+1,1,WTP_index) - NMB(index,1,WTP_index));
+                end
+            
+                %Calculate the expected NMB of stopping and continuing vector
+                %control, given the new updated posterior
+                ExpectedNMB_StopVC = trapz(Posterior_ptd_VALUES, Posterior_ptd_PDF .* interpolated_costs_stop);
+                ExpectedNMB_ContinueVC = trapz(Posterior_ptd_VALUES, Posterior_ptd_PDF .* interpolated_costs_continue);
+            
+                %Decide to stop or continue, depending on expected NMB
+                if ExpectedNMB_ContinueVC < ExpectedNMB_StopVC
+                    AAM_Choice(WTP_index,p_count) = 0;
+                else
+                    AAM_Choice(WTP_index,p_count) = 1;
+                end
+
+            end
+        
+            percent = p_count / length(p_td_range) * 100;
+            disp(string(percent) + '% complete')
+        end
+       
+        for WTP_index = 1:length(WTP_vals)
+          
+            Stop_Indices = find(AAM_Choice(WTP_index,:) < 0.5);
+            Continue_Indices = find(AAM_Choice(WTP_index,:) > 0.5);
+            
+            %Cost of monitoring
+            AAM_Monitoring_Cost = sum(TrapNumbers)*7.01;
+            
+            %Work out NMB of AAM using calculated choice
+            AAM_NMB = zeros(size(p_td_range));
+            AAM_NMB(Stop_Indices) = NMB(Stop_Indices,2,WTP_index) - AAM_Monitoring_Cost;
+            AAM_NMB(Continue_Indices) = NMB(Continue_Indices,1,WTP_index) - AAM_Monitoring_Cost;
+            
+            disp('AAM Calculation Finished')
+            
+            if Mon_ind == ToPlotMonIndex
+                %Plot NMB for each strategy and for AAM
+                figure(length(WTP_vals) + WTP_index)
+                clf(length(WTP_vals) + WTP_index)
+                hold on
+                for i = 1:NumStrat
+                    if i < 3
+                        plot(p_td_range, squeeze(NMB(:,i,WTP_index)), 'DisplayName',Strategy_Names(i),'Color',Strategy_Colour_Palette(i),'Linewidth',4)
+                    end
+                end
+                plot(p_td_range, AAM_NMB, ':k','Linewidth',3,'DisplayName','Active Adaptive Management')
+                hold off
+                xlabel('p target die','FontSize',myfontsize)
+                ylabel('Expected Net Monetary Benefit ($)','FontSize',myfontsize)
+                legend('FontSize',myfontsize)
+                if pri == 1
+                    title('Narrow prior, WTP = '+ string(WTP_vals(WTP_index)) + ', trapping before, 360 days: 1200 traps each','FontSize',myfontsize)
+                else
+                    title('Wide prior, WTP = '+ string(WTP_vals(WTP_index)) + ', trapping before, 360 days: 1200 traps each','FontSize',myfontsize)
+                end
+                set(findall(gcf,'-property','FontSize'),'FontSize',myfontsize)
+            end
+            
+            
+            %Calculate Expected Net Monetary Benefit
+            Strategies = cat(2, Strategy_Names, "AAM");
+            Expected_NMB = zeros(1,NumStrat+1);
+            for i = 1:NumStrat
+                Expected_NMB(i) = trapz(p_td_range, transpose(squeeze(NMB(:,i,WTP_index))) .* ptd_pdf);
+            end
+            Expected_NMB(end) = trapz(p_td_range, AAM_NMB .* ptd_pdf);
+            Benefit(Mon_ind, WTP_index, Sample_ind) = Expected_NMB(end) - max(Expected_NMB(1:4));
+    
+            if Mon_ind == ToPlotMonIndex
+                figure(2*length(WTP_vals) + WTP_index)
+                clf(2*length(WTP_vals) + WTP_index)                 
+                bar(Strategies([1 2 5]),Expected_NMB([1 2 5]))
+                Y = Expected_NMB([1 2 5]);
+                text(1:length(Y),Y,num2str(Y'),'vert','bottom','horiz','center'); 
+                ylabel('Expected Net Monetary Benefit ($)','FontSize',myfontsize)
+                ylim([minNMB,maxNMB])
+                if pri == 1
+                    title('Narrow prior, WTP = '+ string(WTP_vals(WTP_index)) + ', trapping before, 360 days: 1200 traps each','FontSize',myfontsize)
+                else
+                    title('Wide prior, WTP = '+ string(WTP_vals(WTP_index)) + ', trapping before, 360 days: 1200 traps each','FontSize',myfontsize)
+                end
+                set(findall(gcf,'-property','FontSize'),'FontSize',myfontsize)
+            end
+        end
+    end
+
+end
+
+%Calculate Mean Benefit
+MeanBen = zeros(length(WTP_vals),length(MonitoringNums));
+for i = 1:length(WTP_vals)
+    for j = 1:length(MonitoringNums)
+        MeanBen(i,j) = mean(squeeze(Benefit(j,i,:)));
+    end
+end
+figure(3*length(WTP_vals)+1)
+clf(3*length(WTP_vals)+1)
+%Plot mean benefit - note this is only to be used when all monitoring
+%strategies have the same monitoring times, and you want to compare the
+%effect of changing the number of traps used.
+hold on
+for j = 1:length(WTP_vals)
+    plotMonNums = zeros(1,10);
+    for k = 1:length(MonitoringNums)
+        MonNumCell = MonitoringNums{k};
+        plotMonNums(k) = MonNumCell(1);
+    end
+    plotBenefit = squeeze(MeanBen(j,:));
+    plot(plotMonNums, plotBenefit, 'DisplayName', "WTP = $" + string(WTP_vals(j)), 'LineWidth', 4,'Color',Strategy_Colour_Palette(j))
+end
+
+if pri == 1
+    title('Benefit of AAM, with a narrow prior, trapping before and 360 days after intervention','FontSize',myfontsize)
+else
+    title('Benefit of AAM, with a wide prior, trapping before and 360 days after intervention','FontSize',myfontsize)
+end
+ylabel('Expected Benefit ($)','FontSize',myfontsize)
+xlabel('Traps used at each time','FontSize',myfontsize)
+legend('FontSize',myfontsize)
+hold off
+set(findall(gcf,'-property','FontSize'),'FontSize',myfontsize)
